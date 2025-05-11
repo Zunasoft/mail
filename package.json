@@ -1,0 +1,7 @@
+{
+    "name": "barath_portfolio",
+    "scripts": {
+      "start": "node server.js"
+    }
+    
+  }
