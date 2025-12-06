@@ -11,7 +11,7 @@ router.put('/:id/pick', auth(['sales']), leadController.pickLead); // Sales only
 router.get('/analytics', auth(['admin', 'manager']), leadController.getAnalytics);
 
 // Stage Management
-router.get('/stages', auth(['admin', 'manager', 'sales']), leadController.getStages);
+router.get('/stages', leadController.getStages);
 router.post('/stages', auth(['admin', 'manager']), leadController.createStage);
 router.delete('/stages/:id', auth(['admin', 'manager']), leadController.deleteStage);
 
