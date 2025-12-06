@@ -1,106 +1,172 @@
 // server.js
 const express = require('express');
-const nodemailer = require('nodemailer');
+const http = require('http');
+const { Server } = require('socket.io');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+const User = require('./models/User');
+const Message = require('./models/Message');
 
-dotenv.config(); // Load env variables
+dotenv.config();
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: 'http://localhost:5173',
+    methods: ['GET', 'POST']
+  }
+});
+
 app.use(cors());
 app.use(express.json());
 
-// --- MongoDB / Mongoose setup ---
+// --- MongoDB Setup ---
 const mongoUri = process.env.MONGO_URI || 'mongodb://localhost:27017/contactdb';
-
 mongoose.set('strictQuery', false);
-mongoose.connect(mongoUri, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-  .then(() => console.log(`Connected to MongoDB: ${mongoUri}`))
-  .catch((err) => {
-    console.error('MongoDB connection error:', err);
-    // If DB connection fails, we still allow the server to run, but saving will fail.
+mongoose.connect(mongoUri, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => {
+    console.log(`Connected to MongoDB: ${mongoUri}`);
+    seedAdmin();
+  })
+  .catch((err) => console.error('MongoDB connection error:', err));
+
+// --- Seed Admin Function ---
+const seedAdmin = async () => {
+  try {
+    const adminEmail = 'admin@zunasoft.com';
+    const existingAdmin = await User.findOne({ email: adminEmail });
+    if (!existingAdmin) {
+      const admin = new User({
+        username: 'Admin',
+        email: adminEmail,
+        password: 'password',
+        role: 'admin',
+        isApproved: true
+      });
+      await admin.save();
+      console.log('Default Admin Account Created: admin@zunasoft.com / password');
+    } else {
+      console.log('Admin account already exists.');
+    }
+  } catch (err) {
+    console.error('Error seeding admin:', err);
+  }
+};
+
+// --- Socket.IO Authentication Middleware ---
+io.use((socket, next) => {
+  try {
+    const token = socket.handshake.auth.token;
+    if (!token) return next(new Error('Authentication error'));
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secretkey');
+    socket.userId = decoded.userId;
+    socket.userRole = decoded.role;
+    next();
+  } catch (err) {
+    next(new Error('Authentication error'));
+  }
+});
+
+// --- Socket.IO Event Handlers ---
+io.on('connection', async (socket) => {
+  console.log(`User connected: ${socket.userId}`);
+  
+  // Join general room
+  socket.join('general');
+  
+  // Load recent messages for general room
+  const recentMessages = await Message.find({ room: 'general', isPrivate: false })
+    .populate('sender', 'username')
+    .sort({ timestamp: -1 })
+    .limit(50);
+  socket.emit('load_messages', recentMessages.reverse());
+  
+  // Handle sending messages to group
+  socket.on('send_message', async (data) => {
+    try {
+      const message = new Message({
+        sender: socket.userId,
+        content: data.content,
+        room: data.room || 'general',
+        isPrivate: false
+      });
+      await message.save();
+      
+      const populated = await Message.findById(message._id).populate('sender', 'username');
+      io.to(data.room || 'general').emit('receive_message', populated);
+    } catch (err) {
+      console.error('Error sending message:', err);
+    }
   });
-
-// Define a Contact schema and model
-const contactSchema = new mongoose.Schema({
-  name: { type: String, required: true, trim: true },
-  email: { type: String, required: true, trim: true },
-  message: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now },
-});
-
-const Contact = mongoose.model('Contact', contactSchema);
-
-// --- Nodemailer transporter setup ---
-const transporter = nodemailer.createTransport({
-  service: 'Gmail', // or your SMTP provider
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
-
-// verify transporter (optional but useful for debugging)
-transporter.verify((error, success) => {
-  if (error) {
-    console.warn('Warning: Email transporter verify failed:', error.message || error);
-  } else {
-    console.log('Email transporter is ready');
-  }
-});
-
-// --- POST /send route ---
-app.post('/send', async (req, res) => {
-  const { name, email, message } = req.body;
-
-  // basic validation
-  if (!name || !email || !message) {
-    return res.status(400).json({ success: false, error: 'name, email and message are required' });
-  }
-
-  // Create document to save
-  const contactDoc = new Contact({ name, email, message });
-
-  let savedDoc = null;
-  try {
-    // Save to MongoDB
-    savedDoc = await contactDoc.save();
-  } catch (dbErr) {
-    console.error('Failed to save contact to DB:', dbErr);
-    // proceed to try sending email even if DB save failed; respond will indicate partial failure
-  }
-
-  // Prepare email
-  const mailOptions = {
-    from: email || process.env.EMAIL_USER,
-    to: 'info@zunasoft.com',
-    subject: `Message from ${name}`,
-    text: message,
-    // you can also use html: '<p>...</p>' if you'd like
-  };
-
-  try {
-    await transporter.sendMail(mailOptions);
-    // both save and mail might have succeeded or mail succeeded but save failed
-    if (savedDoc) {
-      return res.status(200).json({ success: true, saved: true, emailed: true });
-    } else {
-      return res.status(200).json({ success: true, saved: false, emailed: true, warning: 'Failed to save to DB' });
+  
+  // Handle private messages
+  socket.on('send_private_message', async (data) => {
+    try {
+      const message = new Message({
+        sender: socket.userId,
+        content: data.content,
+        isPrivate: true,
+        recipient: data.recipientId
+      });
+      await message.save();
+      
+      const populated = await Message.findById(message._id)
+        .populate('sender', 'username')
+        .populate('recipient', 'username');
+      
+      // Send to both sender and recipient
+      socket.emit('receive_private_message', populated);
+      io.to(`user_${data.recipientId}`).emit('receive_private_message', populated);
+    } catch (err) {
+      console.error('Error sending private message:', err);
     }
-  } catch (mailErr) {
-    console.error('Failed to send email:', mailErr);
-    // Email failed; but maybe DB saved
-    if (savedDoc) {
-      return res.status(500).json({ success: false, saved: true, emailed: false, error: 'Email failed to send' });
-    } else {
-      return res.status(500).json({ success: false, saved: false, emailed: false, error: 'DB save and email both failed' });
+  });
+  
+  // Load private messages with a specific user
+  socket.on('load_private_messages', async (data) => {
+    try {
+      const messages = await Message.find({
+        isPrivate: true,
+        $or: [
+          { sender: socket.userId, recipient: data.userId },
+          { sender: data.userId, recipient: socket.userId }
+        ]
+      })
+        .populate('sender', 'username')
+        .populate('recipient', 'username')
+        .sort({ timestamp: -1 })
+        .limit(50);
+      
+      socket.emit('private_messages_loaded', messages.reverse());
+    } catch (err) {
+      console.error('Error loading private messages:', err);
     }
-  }
+  });
+  
+  // Join user-specific room for private messages
+  socket.join(`user_${socket.userId}`);
+  
+  socket.on('disconnect', () => {
+    console.log(`User disconnected: ${socket.userId}`);
+  });
 });
+
+// --- Routes ---
+const authRoutes = require('./routes/auth');
+const leadRoutes = require('./routes/leads');
+const taskRoutes = require('./routes/tasks');
+const userRoutes = require('./routes/users');
+const budgetRoutes = require('./routes/budget');
+
+app.use('/api/auth', authRoutes);
+app.use('/api/leads', leadRoutes);
+app.use('/api/tasks', taskRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/budget', budgetRoutes);
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
